@@ -19,8 +19,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 from omegaconf import DictConfig
 from cosyvoice.utils.mask import make_pad_mask
-import time  # 确保在文件开头添加这个导入
-import pdb
 
 
 class MaskedDiffWithXvec(torch.nn.Module):
@@ -94,7 +92,6 @@ class MaskedDiffWithXvec(torch.nn.Module):
 
         mask = (~make_pad_mask(feat_len)).to(h)
         # NOTE this is unnecessary, feat/h already same shape
-        feat = F.interpolate(feat.unsqueeze(dim=1), size=h.shape[1:], mode="nearest").squeeze(dim=1)
         loss, _ = self.decoder.compute_loss(
             feat.transpose(1, 2).contiguous(),
             mask.unsqueeze(1),
@@ -116,8 +113,7 @@ class MaskedDiffWithXvec(torch.nn.Module):
                   flow_cache):
         assert token.shape[0] == 1
         # xvec projection
-        start_time = time.time()
-        
+        embedding = F.normalize(embedding, dim=1)
         embedding = self.spk_embed_affine_layer(embedding)
 
         # concat speech token and prompt speech token
@@ -217,7 +213,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         h = self.encoder_proj(h)
 
         # get conditions
-        feat = F.interpolate(feat.unsqueeze(dim=1), size=h.shape[1:], mode="nearest").squeeze(dim=1)
         conds = torch.zeros(feat.shape, device=token.device)
         for i, j in enumerate(feat_len):
             if random.random() < 0.5:
@@ -246,41 +241,30 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
                   prompt_feat,
                   prompt_feat_len,
                   embedding,
-                  cache,
-                  is_first_chunk,
+                  streaming,
                   finalize,
-                  mask):
+                  mask=None):
         assert token.shape[0] == 1
         # xvec projection
-        start_time = time.time()
-        
         # embedding = F.normalize(embedding, dim=1)
         # embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         if mask is None: mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
-        if mask.shape[1] != token.shape[1]:
-            mask = mask[:, :token.shape[1]]
+        # if mask.shape[1] != token_len:
+            # mask = mask[:, :token_len]
         token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
         # text encode
         if finalize is True:
-            h, h_lengths, encoder_cache = self.encoder.forward_chunk(token, token_len, **cache['encoder_cache'])
+            h, h_lengths = self.encoder(token, token_len, streaming=streaming)
         else:
             token, context = token[:, :-self.pre_lookahead_len], token[:, -self.pre_lookahead_len:]
-            h, h_lengths, encoder_cache = self.encoder.forward_chunk(token, token_len, context=context, **cache['encoder_cache'])
-            # h, h_lengths, encoder_cache = self.encoder.forward_chunk_optimized(token, token_len, context=context, **cache['encoder_cache'])
-
-        cache['encoder_cache']['offset'] = encoder_cache[0]
-        cache['encoder_cache']['pre_lookahead_layer_conv2_cache'] = encoder_cache[1]
-        cache['encoder_cache']['encoders_kv_cache'] = encoder_cache[2]
-        cache['encoder_cache']['upsample_offset'] = encoder_cache[3]
-        cache['encoder_cache']['upsample_conv_cache'] = encoder_cache[4]
-        cache['encoder_cache']['upsample_kv_cache'] = encoder_cache[5]
-
+            h, h_lengths = self.encoder(token, token_len, context=context, streaming=streaming)
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
-
 
         # get conditions
         conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
@@ -288,19 +272,14 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
-        # if is_first_chunk: 
-        #     n_timesteps = 10
-        # else: n_timesteps = 10
-        n_timesteps = 10
-        feat, cache['decoder_cache'] = self.decoder(
+        feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
             spks=embedding,
             cond=conds,
-            n_timesteps=n_timesteps,
-            cache=cache['decoder_cache'],
-            finalize=finalize
+            n_timesteps=10,
+            streaming=streaming
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
-        return feat.float(), cache
+        return feat.float(), None

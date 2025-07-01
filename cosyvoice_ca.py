@@ -14,6 +14,7 @@ sys.path.append('third_party/Matcha-TTS')
 # 添加yaml配置文件加载
 from hyperpyyaml import load_hyperpyyaml
 from cosyvoice.utils.common import fade_in_out
+from cosyvoice.utils.common import TrtContextWrapper
 # 导入所需模型类
 import tensorrt as trt
 # 导入请求库
@@ -73,6 +74,7 @@ class CosyVoiceCA:
         
         # 初始化模型
         logging.info(f"Loading models from {self.model_dir}...")
+        self.first_chunk_buffer_len = 120
         self._init_models()
         
         # 设置flow缓存大小
@@ -80,15 +82,10 @@ class CosyVoiceCA:
         self.source_cache_len = int(self.mel_cache_len * 480)
         self.speech_window = np.hamming(2 * self.source_cache_len)
         
-        # 使用与CosyVoice2相同的上下文管理
-        self.llm_context = torch.cuda.stream(torch.cuda.Stream(self.device)) if torch.cuda.is_available() else nullcontext()
-        
         # 多线程相关 - 使用事件替代轮询
         self.lock = threading.Lock()
         self.token_ready_event = threading.Event()
         self.token_queue = queue.Queue()
-        
-        self.to_save_tokens = []
         
         # 预分配常用的张量
         self.zero_cache_source = torch.zeros(1, 1, 0, device=self.device)
@@ -100,6 +97,7 @@ class CosyVoiceCA:
         
         # 复用session以减少连接开销
         self.session = requests.Session()
+
         
         # warmup_text = ["今天天气不错，适合喝一杯咖啡。", "前方八百米向右前方并入匝道。", "已经帮你操作了", "车门已经打开了", "已将音量调大到百分之三十", "副驾座椅已调直，座椅加热已打开"]
         # for i, text in enumerate(warmup_text, 1):
@@ -118,19 +116,12 @@ class CosyVoiceCA:
             if isinstance(warmup_tokens, list):
                 warmup_tokens = torch.stack(warmup_tokens)
             warmup_pointer = 0
-            is_first_chunk = True
             while warmup_pointer < len(warmup_tokens):
-                if is_first_chunk:
-                    self.first_chunk_params['token'] = warmup_tokens[warmup_pointer:warmup_pointer + 28].unsqueeze(0)
-                    self.first_chunk_params['token_len'] = torch.tensor([28], dtype=torch.int32).to(self.device)
-                    _ = self.token2wav(**self.first_chunk_params)
-                    is_first_chunk = False
-                else:
-                    self.other_chunk_params['token'] = warmup_tokens[warmup_pointer:warmup_pointer + 28].unsqueeze(0)
-                    self.other_chunk_params['token_len'] = torch.tensor([28], dtype=torch.int32).to(self.device)
-                    this_tts_speech = self.token2wav(**self.other_chunk_params)
+                self.flow_inputs['token'] = warmup_tokens[warmup_pointer:warmup_pointer + 51].unsqueeze(0)
+                self.flow_inputs['token_offset'] = 0
+                
+                _ = self.token2wav(**self.flow_inputs)
                 warmup_pointer += 28
-            self.refresh_flow_cache()
         else:
             logging.info("Warmup tokens not found, skipping warmup")
         # Convert list of tensors to a single tensor
@@ -164,7 +155,7 @@ class CosyVoiceCA:
                 
             hift_path = os.path.join(self.model_dir, "hift.pt")
             # spk2info = os.path.join(self.model_dir, "spk2info-old-newcreate.pt")
-            spk2info = os.path.join(self.model_dir, "spk2info-tongtong-short.pt")
+            spk2info = os.path.join(self.model_dir, "spk2info-normal.pt")
             # spk2info = os.path.join(self.model_dir, "spk2info-tong.pt")
             # 检查文件是否存在
             if not os.path.exists(flow_path):
@@ -181,42 +172,18 @@ class CosyVoiceCA:
             self.flow.to(self.device).eval()
             # flow_encoder = torch.jit.load(os.path.join(self.model_dir, "flow.encoder.fp16.zip"), map_location=self.device)
             # self.flow.encoder = flow_encoder
-            self.flow_cache = self.init_flow_cache()
             flow_embedding = F.normalize(self.spk2info['flow_embedding'].half().to(self.device), dim=1)
             self.spk2info['flow_embedding'] = self.flow.spk_embed_affine_layer(flow_embedding).to(self.device)
-            self.spk2info['mask'] = (~make_pad_mask(torch.tensor([self.token_hop_len + self.flow.pre_lookahead_len + self.spk2info['flow_prompt_speech_token'].size(1)]))).unsqueeze(-1).to(self.device)
-            self.first_chunk_params = {
+            self.spk2info['mask'] = (~make_pad_mask(torch.tensor([self.first_chunk_buffer_len]))).unsqueeze(-1).to(self.device)
+            self.flow_inputs = {
                 'prompt_token': self.spk2info['flow_prompt_speech_token'].to(self.device),
                 'prompt_token_len': torch.tensor([self.spk2info['flow_prompt_speech_token'].size(1)], dtype=torch.int32).to(self.device),
                 'prompt_feat': self.spk2info['prompt_speech_feat'].to(self.device),
                 'prompt_feat_len': torch.tensor([self.spk2info['prompt_speech_feat'].size(1)], dtype=torch.int32).to(self.device),
-                'embedding': self.spk2info['flow_embedding'].to(self.device),
+                'embedding': self.spk2info['flow_embedding'],
                 'finalize': False,
-                'is_first_chunk': True,
-                'mask': self.spk2info['mask'].to(self.device)
+                'mask': self.spk2info['mask']
             }  
-            
-            self.zero_prompt_token = torch.zeros(1, 0, dtype=torch.int32, device=self.device)
-            self.zero_prompt_feat = torch.zeros(1, 0, 80, device=self.device)
-            self.other_chunk_params = {
-                'prompt_token': self.zero_prompt_token.to(self.device),
-                'prompt_token_len': torch.tensor([self.zero_prompt_token.size(1)], dtype=torch.int32).to(self.device),
-                'prompt_feat': self.zero_prompt_feat.to(self.device),
-                'prompt_feat_len': torch.tensor([self.zero_prompt_feat.size(1)], dtype=torch.int32).to(self.device),
-                'embedding': self.spk2info['flow_embedding'].to(self.device),
-                'finalize': False,
-                'is_first_chunk': False,
-            } 
-            self.last_chunk_params = {
-                'prompt_token': self.zero_prompt_token.to(self.device),
-                'prompt_token_len': torch.tensor([self.zero_prompt_token.size(1)], dtype=torch.int32).to(self.device),
-                'prompt_feat': self.zero_prompt_feat.to(self.device),
-                'prompt_feat_len': torch.tensor([self.zero_prompt_feat.size(1)], dtype=torch.int32).to(self.device),
-                'embedding': self.spk2info['flow_embedding'].to(self.device),
-                'finalize': True,
-                'is_first_chunk': False,
-            }
-            
             # 处理HiFT模型，按照CosyVoice2处理方式
             hift_state_dict = {k.replace('generator.', ''): v for k, v in torch.load(hift_path, map_location=self.device).items()}
             self.hift.load_state_dict(hift_state_dict, strict=True)
@@ -235,8 +202,8 @@ class CosyVoiceCA:
             # TensorRT引擎文件路径
             flow_decoder_estimator_model = os.path.join(
                 self.model_dir, 
-                f"flow.decoder.estimator.fp16.mygpu.plan"
-                # f"flow.decoder.estimator.fp16.4090.plan"
+                # f"flow.decoder.estimator.fp16.mygpu.plan"
+                f"flow.decoder.estimator.fp16.new.plan"
                 # f"flow.decoder.estimator.fp16.A10.plan"
                 # f"flow.decoder.estimator.fp16.3070.plan"
             )
@@ -250,69 +217,12 @@ class CosyVoiceCA:
                 self.flow.decoder.estimator_engine = trt.Runtime(trt.Logger(trt.Logger.INFO)).deserialize_cuda_engine(f.read())
                 
             assert self.flow.decoder.estimator_engine is not None, f"加载TensorRT失败: {flow_decoder_estimator_model}"
-            self.flow.decoder.estimator = self.flow.decoder.estimator_engine.create_execution_context()
+            self.flow.decoder.estimator = TrtContextWrapper(self.flow.decoder.estimator_engine, trt_concurrent = 1, device=self.device)
+
             
             logging.info("TensorRT模型加载成功")
         except Exception as e:
             logging.error(f"TensorRT模型加载失败: {e}")
-
-    def init_flow_cache(self):
-        print(f"self.flow_decoder_required_cache_size: {self.flow_decoder_required_cache_size}")
-        encoder_cache = {'offset': 0,
-                         'pre_lookahead_layer_conv2_cache': torch.zeros(1, 512, 2).to(self.device),
-                         'encoders_kv_cache': torch.zeros(6, 1, 8, 0, 64 * 2).to(self.device),
-                         'upsample_offset': 0,
-                         'upsample_conv_cache': torch.zeros(1, 512, 4).to(self.device),
-                         'upsample_kv_cache': torch.zeros(4, 1, 8, 0, 64 * 2).to(self.device)}
-        decoder_cache = {'offset': 0,
-                         'down_blocks_conv_cache': torch.zeros(10, 1, 2, 832, 2).to(self.device),
-                         'down_blocks_kv_cache': torch.zeros(10, 1, 4, 2, self.flow_decoder_required_cache_size, 512, 2).to(self.device),
-                         'mid_blocks_conv_cache': torch.zeros(10, 12, 2, 512, 2).to(self.device),
-                         'mid_blocks_kv_cache': torch.zeros(10, 12, 4, 2, self.flow_decoder_required_cache_size, 512, 2).to(self.device),
-                         'up_blocks_conv_cache': torch.zeros(10, 1, 2, 1024, 2).to(self.device),
-                         'up_blocks_kv_cache': torch.zeros(10, 1, 4, 2, self.flow_decoder_required_cache_size, 512, 2).to(self.device),
-                         'final_blocks_conv_cache': torch.zeros(10, 2, 256, 2).to(self.device),
-                         'down_blocks_kv_cache_out': torch.zeros(10, 1, 4, 2, 224, 512, 2).to(self.device),
-                         'mid_blocks_kv_cache_out': torch.zeros(10, 12, 4, 2, 224, 512, 2).to(self.device),
-                         'up_blocks_kv_cache_out': torch.zeros(10, 1, 4, 2, 224, 512, 2).to(self.device),
-                         }
-        if self.fp16 is True:
-            for cache in [encoder_cache, decoder_cache]:
-                for k, v in cache.items():
-                    if isinstance(v, torch.Tensor):
-                        cache[k] = v.half()
-        cache = {'encoder_cache': encoder_cache, 'decoder_cache': decoder_cache}
-        return cache
-
-    def refresh_flow_cache(self):
-        """重置flow cache，恢复初始形状但复用显存"""
-        if hasattr(self, 'flow_cache') and self.flow_cache is not None:
-            # 重置encoder cache
-            encoder_cache = self.flow_cache['encoder_cache']
-            encoder_cache['offset'] = 0
-            dtype = torch.float16 if self.fp16 else torch.float32
-            encoder_cache['pre_lookahead_layer_conv2_cache'] = torch.zeros(1, 512, 2, dtype=dtype, device=self.device)
-            encoder_cache['encoders_kv_cache'] = torch.zeros(6, 1, 8, 0, 64 * 2, dtype=dtype, device=self.device)
-            encoder_cache['upsample_offset'] = 0
-            encoder_cache['upsample_conv_cache'] = torch.zeros(1, 512, 4, dtype=dtype, device=self.device)
-            encoder_cache['upsample_kv_cache'] = torch.zeros(4, 1, 8, 0, 64 * 2, dtype=dtype, device=self.device)
-            
-            # 重置decoder cache  
-            decoder_cache = self.flow_cache['decoder_cache']
-            decoder_cache['offset'] = 0
-            decoder_cache['down_blocks_conv_cache'] = torch.zero_(decoder_cache['down_blocks_conv_cache'])
-            decoder_cache['down_blocks_kv_cache'] = torch.zero_(decoder_cache['down_blocks_kv_cache'])
-            decoder_cache['mid_blocks_conv_cache'] = torch.zero_(decoder_cache['mid_blocks_conv_cache'])
-            decoder_cache['mid_blocks_kv_cache'] = torch.zero_(decoder_cache['mid_blocks_kv_cache'])
-            decoder_cache['up_blocks_conv_cache'] = torch.zero_(decoder_cache['up_blocks_conv_cache'])
-            decoder_cache['up_blocks_kv_cache'] = torch.zero_(decoder_cache['up_blocks_kv_cache'])
-            decoder_cache['final_blocks_conv_cache'] = torch.zero_(decoder_cache['final_blocks_conv_cache'])
-            decoder_cache['down_blocks_kv_cache_out'] = torch.zero_(decoder_cache['down_blocks_kv_cache_out'])
-            decoder_cache['mid_blocks_kv_cache_out'] = torch.zero_(decoder_cache['mid_blocks_kv_cache_out'])
-            decoder_cache['up_blocks_kv_cache_out'] = torch.zero_(decoder_cache['up_blocks_kv_cache_out'])
-        else:
-            # 如果cache不存在，则初始化
-            self.flow_cache = self.init_flow_cache()
 
     def _send_stream_request(self, payload):
         """发送流式请求并处理响应流 - 优化版本"""
@@ -404,8 +314,8 @@ class CosyVoiceCA:
                 "stop_token_ids": [158497]
             }
         }
+        
         for i in self._send_stream_request(payload):
-            
             # 使用锁保护对speech_tokens的修改
             with self.lock:
                 self.speech_tokens.extend(i["tokens"])
@@ -444,10 +354,12 @@ class CosyVoiceCA:
             self.llm_end = False  # 重置LLM结束标志
         
         model_input = self._prepare_input_features(text)
-        is_first_chunk = True
         p = threading.Thread(target=self._llm_job, args=(model_input['llm_input'], model_input['text_len']))
         p.start()
         print("synthesize text:", text)
+        
+        token_offset = 0
+        prompt_token_pad = int(np.ceil(self.spk2info['flow_prompt_speech_token'].size(1) / self.token_hop_len) * self.token_hop_len - self.spk2info['flow_prompt_speech_token'].size(1))
         while True:
             # Wait for tokens to be ready, but don't rely on timeout alone
             self.token_ready_event.wait(timeout=0.1)
@@ -463,91 +375,66 @@ class CosyVoiceCA:
                     self.token_ready_event.clear()
                     continue
                 
-                # 复制需要的tokens，避免长时间持有锁
-                tokens_needed = min(len(self.speech_tokens), 
-                                   self.token_hop_len + self.flow.pre_lookahead_len)
-                current_tokens = list(self.speech_tokens[:tokens_needed])
+                
+            this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
+            required_tokens = this_token_hop_len + self.flow.pre_lookahead_len
             
-            # Clear the event after consuming a token
-            self.token_ready_event.clear()
-            this_tts_speech_token = torch.tensor(current_tokens, device=self.device).unsqueeze(dim=0) - self.offset
-            # if len(this_tts_speech_token[0]) == 28:
-            #     self.to_save_tokens.extend(this_tts_speech_token[0])
-            
-            if is_first_chunk:
-                self.first_chunk_params['token'] = this_tts_speech_token
-                self.first_chunk_params['token_len'] = torch.tensor([this_tts_speech_token.shape[1]], dtype=torch.int32).to(self.device)
-                this_tts_speech = self.token2wav(**self.first_chunk_params)
-                is_first_chunk = False
-            else:
-                self.other_chunk_params['token'] = this_tts_speech_token
-                self.other_chunk_params['token_len'] = torch.tensor([this_tts_speech_token.shape[1]], dtype=torch.int32).to(self.device)
-                this_tts_speech = self.token2wav(**self.other_chunk_params)
-            yield {'tts_speech': this_tts_speech.cpu()}
-            
-            # 使用锁保护移除操作和状态检查
-            with self.lock:
-                self.speech_tokens = self.speech_tokens[self.token_hop_len:]
-                should_break = (self.llm_end is True and 
-                               len(self.speech_tokens) < self.token_hop_len + self.flow.pre_lookahead_len)
-            
-            if should_break:
+            if len(self.speech_tokens) - token_offset >= required_tokens:
+                this_tts_speech_token = torch.tensor(self.speech_tokens[:token_offset + required_tokens]).unsqueeze(dim=0) - self.offset
+                print(f"当前token数: {len(self.speech_tokens)}, 需要: {required_tokens}, 跳跃长度: {this_token_hop_len}")
+                
+                self.flow_inputs['token'] = this_tts_speech_token
+                self.flow_inputs['token_offset'] = token_offset
+                this_tts_speech = self.token2wav(**self.flow_inputs)
+                
+                token_offset += this_token_hop_len
+                
+                yield {'tts_speech': this_tts_speech.cpu()}
+            if self.llm_end and len(self.speech_tokens) - token_offset < required_tokens:
                 break
         p.join()
         
-        # 使用锁保护最后的token处理
-        with self.lock:
-            remaining_tokens = list(self.speech_tokens) if self.speech_tokens else []
-        
-        if len(remaining_tokens) >= 4:
-            this_tts_speech_token = torch.tensor(remaining_tokens).unsqueeze(dim=0) - self.offset
-            self.last_chunk_params['token'] = this_tts_speech_token
-            self.last_chunk_params['token_len'] = torch.tensor([this_tts_speech_token.shape[1]], dtype=torch.int32).to(self.device)
-            this_tts_speech = self.token2wav(**self.last_chunk_params)
-            
-            # 舍弃最后40ms的音频 (40ms * sample_rate = 样本数)
-            samples_to_remove = int(0.04 * self.sample_rate)  # 40ms对应的采样点数
-            if this_tts_speech.shape[1] > samples_to_remove:
-                this_tts_speech = this_tts_speech[:, :-samples_to_remove]
-            
-            yield {'tts_speech': this_tts_speech.cpu()}
-        
-        #重置flow cache
-        self.refresh_flow_cache()
-        
+        this_tts_speech_token = torch.tensor(self.speech_tokens).unsqueeze(dim=0) - self.offset
+        self.flow_inputs['token'] = this_tts_speech_token
+        self.flow_inputs['token_offset'] = token_offset
+        self.flow_inputs['finalize'] = True
+        this_tts_speech = self.token2wav(**self.flow_inputs)
+        yield {'tts_speech': this_tts_speech.cpu()}
         # 使用锁保护状态重置
         with self.lock:
             self.speech_tokens = []
             self.llm_end = False
         self.is_synthesizing = False
-            
-    def token2wav(self, token, token_len, prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, embedding, finalize=False, is_first_chunk=False, mask=None):
+        self.flow_inputs['finalize'] = False
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.current_stream().synchronize()
+
+    def token2wav(self, token, prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, embedding, token_offset, finalize=False, mask=None):
         with torch.cuda.amp.autocast(self.fp16):
-            flow_start = time.time()
-            tts_mel, self.flow_cache = self.flow.inference(token=token.to(self.device),
-                                                                      token_len=token_len,
-                                                                      prompt_token=prompt_token,
-                                                                      prompt_token_len=prompt_token_len,
-                                                                      prompt_feat=prompt_feat,
-                                                                      prompt_feat_len=prompt_feat_len,
-                                                                      embedding=embedding,
-                                                                      cache=self.flow_cache,
-                                                                      is_first_chunk=is_first_chunk,
-                                                                      finalize=finalize,
-                                                                      mask=mask)
-                # append hift cache
-            flow_end = time.time()
-            # print(f"flow inference time: {flow_end - flow_start:.2f}s")
+            tts_mel, _ = self.flow.inference(token=token.to(self.device),
+                                             token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                             prompt_token=prompt_token.to(self.device),
+                                             prompt_token_len=prompt_token_len,
+                                             prompt_feat=prompt_feat,
+                                             prompt_feat_len=prompt_feat_len,
+                                             embedding=embedding,
+                                             streaming=True,
+                                             finalize=finalize,
+                                             mask=mask)
+            tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]                # append hift cache
             if self.hift_cache is not None:
                 hift_cache_mel, hift_cache_source = self.hift_cache['mel'], self.hift_cache['source']
                 tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
             else:
                 hift_cache_source = self.zero_cache_source  # 使用预分配的零张量
+            
             # keep overlap mel and hift cache
             if finalize is False:
                 tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
                 if self.hift_cache is not None:
                     tts_speech = fade_in_out(tts_speech, self.hift_cache['speech'], self.speech_window)
+                
                 self.hift_cache = {'mel': tts_mel[:, :, -self.mel_cache_len:],
                                             'source': tts_source[:, :, -self.source_cache_len:],
                                             'speech': tts_speech[:, -self.source_cache_len:]}
@@ -556,232 +443,8 @@ class CosyVoiceCA:
                 tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
                 if self.hift_cache is not None:
                     tts_speech = fade_in_out(tts_speech, self.hift_cache['speech'], self.speech_window)
-            # print(f"hift inference time: {time.time() - flow_end:.2f}s")
+            
         return tts_speech
-
-    def _safe_cache_copy(self, cache_dict, deep_copy=False):
-        """
-        安全的cache复制方法
-        
-        Args:
-            cache_dict: 要复制的cache字典
-            deep_copy: 是否进行深拷贝
-            
-        Returns:
-            复制后的cache字典
-        """
-        if cache_dict is None:
-            return None
-            
-        safe_cache = {}
-        for key, value in cache_dict.items():
-            if isinstance(value, torch.Tensor):
-                if deep_copy:
-                    # 深拷贝：完全独立的内存
-                    safe_cache[key] = value.clone().detach()
-                else:
-                    # 浅拷贝：共享数据但独立的张量对象
-                    safe_cache[key] = value.detach()
-            else:
-                # 非张量值直接复制
-                safe_cache[key] = value
-        return safe_cache
-    
-    def _validate_cache_memory_safety(self, cache_dict):
-        """
-        验证cache的内存安全性
-        
-        Args:
-            cache_dict: 要验证的cache字典
-            
-        Returns:
-            bool: 是否通过验证
-        """
-        if cache_dict is None:
-            return False
-            
-        try:
-            for key, tensor in cache_dict.items():
-                if isinstance(tensor, torch.Tensor):
-                    # 检查张量是否连续
-                    if not tensor.is_contiguous():
-                        print(f"警告: cache[{key}] 不是连续内存布局")
-                        return False
-                    
-                    # 检查内存是否有效（通过访问data_ptr）
-                    _ = tensor.data_ptr()
-                    
-                    # 检查设备一致性
-                    if tensor.device != self.device:
-                        print(f"警告: cache[{key}] 设备不匹配，期望{self.device}，实际{tensor.device}")
-                        return False
-                        
-            return True
-        except Exception as e:
-            print(f"cache内存验证失败: {e}")
-            return False
-    
-    def _safe_forward_chunk_call(self, encoder, token, token_len, context=None, cache=None, use_safe_copy=True):
-        """
-        安全的forward_chunk调用
-        
-        Args:
-            encoder: encoder对象
-            token: 输入token
-            token_len: token长度
-            context: 上下文（可选）
-            cache: cache字典
-            use_safe_copy: 是否使用安全复制
-            
-        Returns:
-            tuple: (h, h_lengths, new_cache)
-        """
-        if cache is None:
-            cache = {}
-            
-        # 验证输入cache的安全性
-        if not self._validate_cache_memory_safety(cache):
-            print("输入cache验证失败，使用默认cache")
-            cache = {}
-        
-        # 准备安全的cache参数
-        if use_safe_copy and cache:
-            safe_cache = self._safe_cache_copy(cache, deep_copy=False)
-        else:
-            safe_cache = cache
-            
-        try:
-            # 调用forward_chunk
-            if context is not None:
-                result = encoder.forward_chunk(token, token_len, context=context, **safe_cache)
-            else:
-                result = encoder.forward_chunk(token, token_len, **safe_cache)
-                
-            # 验证输出
-            h, h_lengths, new_cache = result
-            
-            # 检查输出的有效性
-            if torch.isnan(h).any() or torch.isinf(h).any():
-                raise RuntimeError("forward_chunk输出包含NaN或Inf值")
-                
-            return h, h_lengths, new_cache
-            
-        except RuntimeError as e:
-            if "CUDA error" in str(e) or "device-side assert" in str(e):
-                print(f"CUDA错误，可能与cache内存状态有关: {e}")
-                # 清理可能损坏的内存状态
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-            raise e
-
-    def demonstrate_cache_passing_risks(self):
-        """
-        演示不同cache传递方式的风险和对比
-        
-        这个方法展示了：
-        1. 直接传递的风险
-        2. 使用data_ptr()的场景
-        3. 安全传递的最佳实践
-        """
-        print("=== Cache传递方式风险分析演示 ===")
-        
-        # 创建一个示例cache
-        test_cache = {
-            'offset': 0,
-            'conv_cache': torch.randn(1, 512, 2, device=self.device),
-            'kv_cache': torch.randn(6, 1, 8, 0, 128, device=self.device)
-        }
-        
-        print("1. 原始cache状态:")
-        for key, value in test_cache.items():
-            if isinstance(value, torch.Tensor):
-                print(f"   {key}: shape={value.shape}, data_ptr={hex(value.data_ptr())}")
-        
-        # 方式1: 直接传递引用（风险较高）
-        print("\n2. 直接传递引用的风险:")
-        def risky_function(**cache_params):
-            """模拟一个可能修改cache的函数"""
-            if 'conv_cache' in cache_params:
-                # 直接修改传入的张量
-                cache_params['conv_cache'].fill_(999.0)  # 风险操作
-                print(f"   函数内修改后 conv_cache 前几个值: {cache_params['conv_cache'].flatten()[:3]}")
-        
-        print("   调用前 conv_cache 前几个值:", test_cache['conv_cache'].flatten()[:3])
-        risky_function(**test_cache)  # 直接传递
-        print("   调用后 conv_cache 前几个值:", test_cache['conv_cache'].flatten()[:3])
-        print("   ❌ 原始cache被意外修改！")
-        
-        # 方式2: 使用data_ptr()（底层操作）
-        print("\n3. data_ptr()方式的特点:")
-        conv_cache = test_cache['conv_cache']
-        print(f"   data_ptr: {hex(conv_cache.data_ptr())}")
-        print(f"   is_contiguous: {conv_cache.is_contiguous()}")
-        print(f"   element_size: {conv_cache.element_size()} bytes")
-        print(f"   总内存大小: {conv_cache.numel() * conv_cache.element_size()} bytes")
-        
-        # 检查内存连续性的重要性
-        non_contiguous = conv_cache.transpose(0, 1)  # 创建非连续张量
-        print(f"   转置后 is_contiguous: {non_contiguous.is_contiguous()}")
-        print("   💡 非连续张量需要调用 .contiguous() 才能安全使用data_ptr()")
-        
-        # 方式3: 安全复制（推荐）
-        print("\n4. 安全复制方式:")
-        safe_cache = self._safe_cache_copy(test_cache, deep_copy=False)
-        
-        def safe_function(**cache_params):
-            if 'conv_cache' in cache_params:
-                cache_params['conv_cache'].fill_(777.0)
-                print(f"   安全函数内修改后: {cache_params['conv_cache'].flatten()[:3]}")
-        
-        print("   原始cache:", test_cache['conv_cache'].flatten()[:3])
-        safe_function(**safe_cache)
-        print("   调用后原始cache:", test_cache['conv_cache'].flatten()[:3])
-        print("   ✅ 原始cache未被修改，但共享底层内存（适合大多数场景）")
-        
-        # 方式4: 深拷贝（最安全但开销大）
-        print("\n5. 深拷贝方式:")
-        deep_cache = self._safe_cache_copy(test_cache, deep_copy=True)
-        print(f"   原始 data_ptr: {hex(test_cache['conv_cache'].data_ptr())}")
-        print(f"   深拷贝 data_ptr: {hex(deep_cache['conv_cache'].data_ptr())}")
-        print("   ✅ 完全独立的内存，但消耗更多显存")
-        
-        print("\n=== 推荐使用场景 ===")
-        print("1. 普通推理: 使用浅拷贝 (_safe_cache_copy(deep_copy=False))")
-        print("2. 批量测试: 使用深拷贝 (_safe_cache_copy(deep_copy=True))")
-        print("3. TensorRT/C++调用: 使用 tensor.contiguous().data_ptr()")
-        print("4. 调试问题: 使用 _validate_cache_memory_safety() 检查")
-    
-    def get_cache_memory_info(self, cache_dict, name="cache"):
-        """
-        获取cache的详细内存信息
-        
-        Args:
-            cache_dict: cache字典
-            name: cache名称
-            
-        Returns:
-            str: 内存信息摘要
-        """
-        if cache_dict is None:
-            return f"{name}: None"
-        
-        info_lines = [f"{name} 内存信息:"]
-        total_memory = 0
-        
-        for key, value in cache_dict.items():
-            if isinstance(value, torch.Tensor):
-                memory_size = value.numel() * value.element_size()
-                total_memory += memory_size
-                info_lines.append(
-                    f"  {key}: {value.shape} | {memory_size/1024/1024:.2f}MB | "
-                    f"ptr={hex(value.data_ptr())} | contiguous={value.is_contiguous()}"
-                )
-            else:
-                info_lines.append(f"  {key}: {value} (非张量)")
-        
-        info_lines.append(f"总内存使用: {total_memory/1024/1024:.2f}MB")
-        return "\n".join(info_lines)
 
 # 使用示例
 if __name__ == "__main__":
@@ -810,28 +473,34 @@ if __name__ == "__main__":
         log_file.write(message + "\n")
         log_file.flush()
     
-    # 从test.txt文件读取测试文本
-    log_and_print(f"\n=== 批量测试：从test.txt文件读取文本 ===")
+    # 从test.txt文件读取测试文本 - 批量测试模式
+    log_and_print(f"\n=== 批量测试：从test.txt文件读取所有文本 ===")
     txt_file_path = "test.txt"
     try:
         with open(txt_file_path, 'r', encoding='utf-8') as f:
             text_lines = [line.strip() for line in f.readlines() if line.strip()]
     except FileNotFoundError:
-        log_and_print(f"警告：找不到文件 {txt_file_path}，退出程序")
-        log_file.close()
-        exit(1)
+        log_and_print(f"警告：找不到文件 {txt_file_path}，使用默认测试文本")
+        text_lines = ["今天天气不错，适合出去走走。"]
     except Exception as e:
-        log_and_print(f"读取文件时出错: {e}，退出程序")
-        log_file.close()
-        exit(1)
+        log_and_print(f"读取文件时出错: {e}，使用默认测试文本")
+        text_lines = ["今天天气不错，适合出去走走。"]
     
     if not text_lines:
-        log_and_print(f"文件 {txt_file_path} 为空，退出程序")
-        log_file.close()
-        exit(1)
-        
-    log_and_print(f"开始从 {txt_file_path} 逐行合成文本...")
-    log_and_print(f"共找到 {len(text_lines)} 行文本")
+        log_and_print(f"文件 {txt_file_path} 为空，使用默认测试文本")
+        text_lines = ["今天天气不错，适合出去走走。"]
+    
+    log_and_print(f"开始批量测试，共找到 {len(text_lines)} 条文本")
+    if len(text_lines) <= 5:
+        for i, text in enumerate(text_lines, 1):
+            display_text = text[:50] + "..." if len(text) > 50 else text
+            log_and_print(f"  第{i}条: '{display_text}'")
+    else:
+        log_and_print(f"  前3条:")
+        for i in range(3):
+            display_text = text_lines[i][:50] + "..." if len(text_lines[i]) > 50 else text_lines[i]
+            log_and_print(f"    第{i+1}条: '{display_text}'")
+        log_and_print(f"  ... 共{len(text_lines)}条文本")
     
     # 存储性能数据
     first_packet_times = []
@@ -852,20 +521,27 @@ if __name__ == "__main__":
         
         try:
             current_line_segments = []
+            chunk_count = 0
+            log_and_print("开始合成，实时输出音频块...")
+            
             for result in cosyvoice_ca.synthesize(text):
+                chunk_count += 1
                 # 记录首包时间
                 if first_packet_time is None:
                     first_packet_time = time.time()
                     current_first_packet_delay = first_packet_time - start_time
-                    log_and_print(f"首包时延: {current_first_packet_delay:.2f}秒")
+                    log_and_print(f"📦 首包时延: {current_first_packet_delay:.2f}秒")
                     first_packet_times.append(current_first_packet_delay)
-                    
+                
                 current_line_segments.append(result['tts_speech'])
+                current_audio_length = result['tts_speech'].shape[1] / cosyvoice_ca.sample_rate
+                log_and_print(f"  💫 第{chunk_count}个音频块: {current_audio_length:.2f}秒")
             
             # 记录合成结束时间
             synthesis_time = time.time()
             synthesis_duration = synthesis_time - start_time
-            log_and_print(f"合成耗时: {synthesis_duration:.2f}秒")
+            log_and_print(f"⏱️ 总合成耗时: {synthesis_duration:.2f}秒")
+            log_and_print(f"📊 总共生成了 {chunk_count} 个音频块")
             
             # 合并当前行的所有音频片段并保存
             if current_line_segments:
@@ -875,22 +551,24 @@ if __name__ == "__main__":
                 # 计算实时率 (RTF = 合成时间 / 音频长度)
                 rtf = synthesis_duration / audio_length
                 rtf_values.append(rtf)
-                log_and_print(f"实时率(RTF): {rtf:.2f}")
-                log_and_print(f"音频长度: {audio_length:.2f}秒")
+                log_and_print(f"🚀 实时率(RTF): {rtf:.2f}")
+                log_and_print(f"🎵 音频总长度: {audio_length:.2f}秒")
                 
                 line_output_path = f"outputs/batch_test_{i:04d}.wav"
                 torchaudio.save(line_output_path, combined_line_audio, cosyvoice_ca.sample_rate)
-                log_and_print(f"✓ 已保存音频: {line_output_path}")
+                log_and_print(f"✅ 已保存音频: {line_output_path}")
                 successful_count += 1
                 
                 # 记录最后一句的音频用于最终报告
                 if i == len(text_lines):
                     last_audio = combined_line_audio
             else:
-                log_and_print(f"❌ 第 {i} 行没有生成音频片段")
+                log_and_print(f"❌ 没有生成音频片段")
                 
         except Exception as e:
-            log_and_print(f"第 {i} 行合成失败: {e}")
+            log_and_print(f"❌ 第 {i} 行合成失败: {e}")
+            import traceback
+            log_and_print(f"详细错误信息: {traceback.format_exc()}")
             continue
     
     # 统计结果
