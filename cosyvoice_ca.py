@@ -99,29 +99,19 @@ class CosyVoiceCA:
         self.session = requests.Session()
 
         
-        # warmup_text = ["今天天气不错，适合喝一杯咖啡。", "前方八百米向右前方并入匝道。", "已经帮你操作了", "车门已经打开了", "已将音量调大到百分之三十", "副驾座椅已调直，座椅加热已打开"]
-        # for i, text in enumerate(warmup_text, 1):
-        #     print(f"Warmup {i}/{len(warmup_text)}: {text}")
-        #     # 等待上一句完全结束
-        #     while self.is_synthesizing:
-        #         time.sleep(0.01)
-        #     # 完全消费生成器，确保这句话完全合成完毕
-        #     for _ in self.synthesize(text):
-        #         pass
-        #     print(f"Warmup {i} completed")
-        #     torch.save(self.to_save_tokens, os.path.join(self.model_dir, "warmup_tokens.pt"))
         if os.path.exists(os.path.join(self.model_dir, "warmup_tokens.pt")):
             logging.info("warmup start")
             warmup_tokens = torch.load(os.path.join(self.model_dir, "warmup_tokens.pt"))
             if isinstance(warmup_tokens, list):
                 warmup_tokens = torch.stack(warmup_tokens)
             warmup_pointer = 0
-            while warmup_pointer < len(warmup_tokens):
-                self.flow_inputs['token'] = warmup_tokens[warmup_pointer:warmup_pointer + 51].unsqueeze(0)
+            hop_size = self.token_hop_len + self.prompt_token_pad + self.flow.pre_lookahead_len
+            while warmup_pointer + hop_size < len(warmup_tokens):
+                self.flow_inputs['token'] = warmup_tokens[warmup_pointer:warmup_pointer + hop_size].unsqueeze(0)
                 self.flow_inputs['token_offset'] = 0
-                
+                self.flow_inputs['mask'] = self.spk2info['mask']
                 _ = self.token2wav(**self.flow_inputs)
-                warmup_pointer += 28
+                warmup_pointer += self.token_hop_len
         else:
             logging.info("Warmup tokens not found, skipping warmup")
         # Convert list of tensors to a single tensor
@@ -174,7 +164,9 @@ class CosyVoiceCA:
             # self.flow.encoder = flow_encoder
             flow_embedding = F.normalize(self.spk2info['flow_embedding'].half().to(self.device), dim=1)
             self.spk2info['flow_embedding'] = self.flow.spk_embed_affine_layer(flow_embedding).to(self.device)
-            self.spk2info['mask'] = (~make_pad_mask(torch.tensor([self.first_chunk_buffer_len]))).unsqueeze(-1).to(self.device)
+            self.prompt_token_pad = int(np.ceil(self.spk2info['flow_prompt_speech_token'].size(1) / self.token_hop_len) * self.token_hop_len - self.spk2info['flow_prompt_speech_token'].size(1))
+    
+            self.spk2info['mask'] = (~make_pad_mask(torch.tensor([self.flow.pre_lookahead_len + self.token_hop_len + self.prompt_token_pad + self.spk2info['flow_prompt_speech_token'].size(1)]))).unsqueeze(-1).to(self.device)
             self.flow_inputs = {
                 'prompt_token': self.spk2info['flow_prompt_speech_token'].to(self.device),
                 'prompt_token_len': torch.tensor([self.spk2info['flow_prompt_speech_token'].size(1)], dtype=torch.int32).to(self.device),
@@ -330,9 +322,66 @@ class CosyVoiceCA:
             self.llm_end = True
         self.token_ready_event.set()  # 确保主线程能被唤醒
     
+    def _reset_cuda_state(self):
+        """重置CUDA状态和实例状态，用于错误恢复"""
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+            
+            # 重置实例状态
+            with self.lock:
+                self.speech_tokens.clear()  # 使用clear()来清空deque
+                self.llm_end = False
+            self.is_synthesizing = False
+            self.hift_cache = None
+            
+            # 重置 flow_inputs 的动态部分
+            if hasattr(self, 'flow_inputs'):
+                self.flow_inputs['finalize'] = False
+                self.flow_inputs['mask'] = self.spk2info['mask']
+                if 'token' in self.flow_inputs:
+                    del self.flow_inputs['token']
+                if 'token_offset' in self.flow_inputs:
+                    del self.flow_inputs['token_offset']
+            
+            logging.info("CUDA状态和实例状态已重置")
+            return True
+        except Exception as e:
+            logging.error(f"重置状态时出错: {e}")
+            return False
+
+    def _safe_token2wav(self, **kwargs):
+        """带容错的 token2wav 方法"""
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                return self.token2wav(**kwargs)
+            except RuntimeError as e:
+                error_msg = str(e)
+                if "device-side assert triggered" in error_msg or "CUDA error" in error_msg:
+                    logging.warning(f"CUDA错误 (尝试 {attempt + 1}/{max_retries}): {error_msg}")
+                    
+                    if attempt < max_retries - 1:
+                        # 尝试恢复
+                        logging.info("尝试恢复CUDA状态...")
+                        self._reset_cuda_state()
+                        time.sleep(0.1)  # 短暂等待
+                        continue
+                    else:
+                        logging.error("CUDA错误恢复失败，跳过当前chunk")
+                        return None
+                else:
+                    # 非CUDA错误，直接抛出
+                    raise
+        
+        return None
+
     def synthesize(self, text: str, session_id: str = "default") -> Generator[Dict, None, None]:
         """
-        合成语音
+        合成语音 - 带容错机制
         
         Args:
             text: 输入文本
@@ -345,70 +394,140 @@ class CosyVoiceCA:
             logging.info("正在合成中，请稍后再试")
             return
         
+        # 初始状态设置
         self.is_synthesizing = True
-        self.hift_cache = None  # 重置hift缓存
+        synthesis_success = False
         
-        # 使用锁保护状态初始化
-        with self.lock:
-            self.speech_tokens = []  # 重置语音token
-            self.llm_end = False  # 重置LLM结束标志
-        
-        model_input = self._prepare_input_features(text)
-        p = threading.Thread(target=self._llm_job, args=(model_input['llm_input'], model_input['text_len']))
-        p.start()
-        print("synthesize text:", text)
-        
-        token_offset = 0
-        prompt_token_pad = int(np.ceil(self.spk2info['flow_prompt_speech_token'].size(1) / self.token_hop_len) * self.token_hop_len - self.spk2info['flow_prompt_speech_token'].size(1))
-        while True:
-            # Wait for tokens to be ready, but don't rely on timeout alone
-            self.token_ready_event.wait(timeout=0.1)
+        try:
+            # 重置状态
+            self.hift_cache = None
             
-            # 使用锁保护对speech_tokens的访问和状态检查
+                                      # 使用锁保护状态初始化
             with self.lock:
-                # Check if we have tokens available before attempting to pop
-                if not self.speech_tokens:
-                    # If no tokens available but LLM has ended, break the loop
-                    if self.llm_end:
-                        break
-                    # Reset the event and continue waiting
-                    self.token_ready_event.clear()
-                    continue
-                
-                
-            this_token_hop_len = self.token_hop_len + prompt_token_pad if token_offset == 0 else self.token_hop_len
-            required_tokens = this_token_hop_len + self.flow.pre_lookahead_len
+                self.speech_tokens.clear()
+                self.llm_end = False
             
-            if len(self.speech_tokens) - token_offset >= required_tokens:
-                this_tts_speech_token = torch.tensor(self.speech_tokens[:token_offset + required_tokens]).unsqueeze(dim=0) - self.offset
-                print(f"当前token数: {len(self.speech_tokens)}, 需要: {required_tokens}, 跳跃长度: {this_token_hop_len}")
+            model_input = self._prepare_input_features(text)
+            time_llm_start = time.time()
+            p = threading.Thread(target=self._llm_job, args=(model_input['llm_input'], model_input['text_len']))
+            p.start()
+            print("synthesize text:", text)
+            is_first_chunk = True
+            token_offset = 0
+            chunks_generated = 0
+            
+            while True:
+                # Wait for tokens to be ready
+                self.token_ready_event.wait(timeout=0.1)
                 
-                self.flow_inputs['token'] = this_tts_speech_token
-                self.flow_inputs['token_offset'] = token_offset
-                this_tts_speech = self.token2wav(**self.flow_inputs)
+                # 使用锁保护对speech_tokens的访问和状态检查
+                with self.lock:
+                    if not self.speech_tokens:
+                        if self.llm_end:
+                            break
+                        self.token_ready_event.clear()
+                        continue
                 
-                token_offset += this_token_hop_len
+                this_token_hop_len = self.token_hop_len + self.prompt_token_pad if token_offset == 0 else self.token_hop_len
+                required_tokens = this_token_hop_len + self.flow.pre_lookahead_len
                 
-                yield {'tts_speech': this_tts_speech.cpu()}
-            if self.llm_end and len(self.speech_tokens) - token_offset < required_tokens:
-                break
-        p.join()
+                if len(self.speech_tokens) - token_offset >= required_tokens:
+                    time_llm_first_chunk_end = time.time()
+                    print(f"llm first chunk time in ms: {(time_llm_first_chunk_end - time_llm_start) * 1000}")
+                    # 修复：将 deque 转换为 list 以支持切片操作
+                    speech_tokens_list = list(self.speech_tokens)
+                    this_tts_speech_token = torch.tensor(speech_tokens_list[:token_offset + required_tokens]).unsqueeze(dim=0) - self.offset
+                    print(f"当前token数: {len(self.speech_tokens)}, 需要: {required_tokens}, 跳跃长度: {this_token_hop_len}")
+                    
+                    # 准备参数
+                    self.flow_inputs['token'] = this_tts_speech_token
+                    self.flow_inputs['token_offset'] = token_offset
+                    if is_first_chunk:
+                        self.flow_inputs['mask'] = self.spk2info['mask']
+                        is_first_chunk = False
+                    else: 
+                        self.flow_inputs['mask'] = None
+                    
+                    # 安全调用 token2wav
+                    try:
+                        this_tts_speech = self._safe_token2wav(**self.flow_inputs)
+                        
+                        if this_tts_speech is not None:
+                            token_offset += this_token_hop_len
+                            chunks_generated += 1
+                            yield {'tts_speech': this_tts_speech.cpu()}
+                        else:
+                            # 如果当前chunk失败，记录并继续
+                            logging.warning(f"Chunk {chunks_generated + 1} 生成失败，跳过")
+                            token_offset += this_token_hop_len
+                            
+                    except Exception as e:
+                        logging.error(f"处理音频chunk时出错: {e}")
+                        # 尝试恢复并继续
+                        self._reset_cuda_state()
+                        token_offset += this_token_hop_len
+                        continue
+                
+                if self.llm_end and len(self.speech_tokens) - token_offset < required_tokens:
+                    break
+            
+            # 等待LLM线程结束
+            p.join()
+            
+            # 最终处理
+            try:
+                if len(self.speech_tokens) > token_offset:
+                    # 修复：将 deque 转换为 list 以支持 torch.tensor 转换
+                    speech_tokens_list = list(self.speech_tokens)
+                    this_tts_speech_token = torch.tensor(speech_tokens_list).unsqueeze(dim=0) - self.offset
+                    self.flow_inputs['token'] = this_tts_speech_token
+                    self.flow_inputs['token_offset'] = token_offset
+                    self.flow_inputs['finalize'] = True
+                    self.flow_inputs['mask'] = None
+                    
+                    final_speech = self._safe_token2wav(**self.flow_inputs)
+                    if final_speech is not None:
+                        yield {'tts_speech': final_speech.cpu()}
+                        synthesis_success = True
+                    else:
+                        logging.warning("最终chunk生成失败")
+                
+            except Exception as e:
+                logging.error(f"最终处理时出错: {e}")
+                # 即使最终处理失败，如果之前有成功的chunk，也算部分成功
+                if chunks_generated > 0:
+                    synthesis_success = True
         
-        this_tts_speech_token = torch.tensor(self.speech_tokens).unsqueeze(dim=0) - self.offset
-        self.flow_inputs['token'] = this_tts_speech_token
-        self.flow_inputs['token_offset'] = token_offset
-        self.flow_inputs['finalize'] = True
-        this_tts_speech = self.token2wav(**self.flow_inputs)
-        yield {'tts_speech': this_tts_speech.cpu()}
-        # 使用锁保护状态重置
-        with self.lock:
-            self.speech_tokens = []
-            self.llm_end = False
-        self.is_synthesizing = False
-        self.flow_inputs['finalize'] = False
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.current_stream().synchronize()
+        except Exception as e:
+            logging.error(f"合成过程中出现未预期错误: {e}")
+            import traceback
+            logging.error(f"详细错误信息: {traceback.format_exc()}")
+        
+        finally:
+            # 确保状态正确重置
+            try:
+                # 使用锁保护状态重置
+                with self.lock:
+                    self.speech_tokens.clear()
+                    self.llm_end = False
+                    self.is_synthesizing = False
+                    if hasattr(self, 'flow_inputs'):
+                        self.flow_inputs['finalize'] = False
+                
+                # 清理CUDA缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.current_stream().synchronize()
+                
+                if synthesis_success:
+                    logging.info(f"文本合成完成: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+                else:
+                    logging.warning(f"文本合成失败或部分失败: '{text[:50]}{'...' if len(text) > 50 else ''}'")
+                    
+            except Exception as cleanup_error:
+                logging.error(f"清理状态时出错: {cleanup_error}")
+                # 强制重置关键状态
+                self.is_synthesizing = False
 
     def token2wav(self, token, prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, embedding, token_offset, finalize=False, mask=None):
         with torch.cuda.amp.autocast(self.fp16):
@@ -422,6 +541,7 @@ class CosyVoiceCA:
                                              streaming=True,
                                              finalize=finalize,
                                              mask=mask)
+            time_start = time.time()
             tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]                # append hift cache
             if self.hift_cache is not None:
                 hift_cache_mel, hift_cache_source = self.hift_cache['mel'], self.hift_cache['source']
@@ -431,7 +551,10 @@ class CosyVoiceCA:
             
             # keep overlap mel and hift cache
             if finalize is False:
+                time_hift_inference_start = time.time()
                 tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+                time_hift_inference_end = time.time()
+                print(f"hift inference time in ms: {(time_hift_inference_end - time_hift_inference_start) * 1000}")
                 if self.hift_cache is not None:
                     tts_speech = fade_in_out(tts_speech, self.hift_cache['speech'], self.speech_window)
                 
@@ -443,7 +566,8 @@ class CosyVoiceCA:
                 tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
                 if self.hift_cache is not None:
                     tts_speech = fade_in_out(tts_speech, self.hift_cache['speech'], self.speech_window)
-            
+            time_end = time.time()
+            print(f"hift time in ms: {(time_end - time_start) * 1000}")
         return tts_speech
 
 # 使用示例
@@ -454,6 +578,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CosyVoiceCA演示程序")
     parser.add_argument("--model_dir", type=str, required=True, help="模型目录路径")
     parser.add_argument("--output", type=str, default="output.wav", help="输出音频文件路径")
+    parser.add_argument("--mode", type=str, choices=['single', 'batch'], default='batch', help="测试模式: single=单条测试, batch=批量测试")
+    parser.add_argument("--text", type=str, default="今天天气怎么样", help="单条测试时使用的文本")
     args = parser.parse_args()
     
     # 设置日志
@@ -473,22 +599,29 @@ if __name__ == "__main__":
         log_file.write(message + "\n")
         log_file.flush()
     
-    # 从test.txt文件读取测试文本 - 批量测试模式
-    log_and_print(f"\n=== 批量测试：从test.txt文件读取所有文本 ===")
-    txt_file_path = "test.txt"
-    try:
-        with open(txt_file_path, 'r', encoding='utf-8') as f:
-            text_lines = [line.strip() for line in f.readlines() if line.strip()]
-    except FileNotFoundError:
-        log_and_print(f"警告：找不到文件 {txt_file_path}，使用默认测试文本")
-        text_lines = ["今天天气不错，适合出去走走。"]
-    except Exception as e:
-        log_and_print(f"读取文件时出错: {e}，使用默认测试文本")
-        text_lines = ["今天天气不错，适合出去走走。"]
-    
-    if not text_lines:
-        log_and_print(f"文件 {txt_file_path} 为空，使用默认测试文本")
-        text_lines = ["今天天气不错，适合出去走走。"]
+    # 根据模式选择测试方式
+    if args.mode == 'single':
+        # 单条测试模式
+        log_and_print(f"\n=== 单条测试模式 ===")
+        log_and_print(f"测试文本: '{args.text}'")
+        text_lines = [args.text]
+    else:
+        # 从test.txt文件读取测试文本 - 批量测试模式
+        log_and_print(f"\n=== 批量测试：从test.txt文件读取所有文本 ===")
+        txt_file_path = "test.txt"
+        try:
+            with open(txt_file_path, 'r', encoding='utf-8') as f:
+                text_lines = [line.strip() for line in f.readlines() if line.strip()]
+        except FileNotFoundError:
+            log_and_print(f"警告：找不到文件 {txt_file_path}，使用默认测试文本")
+            text_lines = ["今天天气不错，适合出去走走。"]
+        except Exception as e:
+            log_and_print(f"读取文件时出错: {e}，使用默认测试文本")
+            text_lines = ["今天天气不错，适合出去走走。"]
+        
+        if not text_lines:
+            log_and_print(f"文件 {txt_file_path} 为空，使用默认测试文本")
+            text_lines = ["今天天气不错，适合出去走走。"]
     
     log_and_print(f"开始批量测试，共找到 {len(text_lines)} 条文本")
     if len(text_lines) <= 5:
@@ -554,7 +687,10 @@ if __name__ == "__main__":
                 log_and_print(f"🚀 实时率(RTF): {rtf:.2f}")
                 log_and_print(f"🎵 音频总长度: {audio_length:.2f}秒")
                 
-                line_output_path = f"outputs/batch_test_{i:04d}.wav"
+                if args.mode == 'single':
+                    line_output_path = f"outputs/single_test.wav"
+                else:
+                    line_output_path = f"outputs/batch_test_{i:04d}.wav"
                 torchaudio.save(line_output_path, combined_line_audio, cosyvoice_ca.sample_rate)
                 log_and_print(f"✅ 已保存音频: {line_output_path}")
                 successful_count += 1
@@ -573,7 +709,10 @@ if __name__ == "__main__":
     
     # 统计结果
     log_and_print("\n" + "="*50)
-    log_and_print("📊 批量测试统计报告")
+    if args.mode == 'single':
+        log_and_print("📊 单条测试统计报告")
+    else:
+        log_and_print("📊 批量测试统计报告")
     log_and_print("="*50)
     
     log_and_print(f"总文本数量: {len(text_lines)}")
@@ -607,7 +746,10 @@ if __name__ == "__main__":
         
         # 总结保存的音频文件
         log_and_print(f"\n💾 共保存了 {successful_count} 个音频文件:")
-        log_and_print(f"  音频文件保存在: outputs/batch_test_XXXX.wav")
+        if args.mode == 'single':
+            log_and_print(f"  音频文件保存在: outputs/single_test.wav")
+        else:
+            log_and_print(f"  音频文件保存在: outputs/batch_test_XXXX.wav")
         
         # 同时保存最后一句到指定的输出文件
         if last_audio is not None:

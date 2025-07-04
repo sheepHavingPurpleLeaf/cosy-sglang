@@ -19,7 +19,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from omegaconf import DictConfig
 from cosyvoice.utils.mask import make_pad_mask
-
+# import time
 
 class MaskedDiffWithXvec(torch.nn.Module):
     def __init__(self,
@@ -250,8 +250,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         # embedding = self.spk_embed_affine_layer(embedding)
 
         # concat text and prompt_text
+        # time_start = time.time()
         token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
-        mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+        # mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         if mask is None: mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
         # if mask.shape[1] != token_len:
             # mask = mask[:, :token_len]
@@ -263,6 +264,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         else:
             token, context = token[:, :-self.pre_lookahead_len], token[:, -self.pre_lookahead_len:]
             h, h_lengths = self.encoder(token, token_len, context=context, streaming=streaming)
+        print(token_len, h.shape, prompt_feat.shape)
         mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
         h = self.encoder_proj(h)
 
@@ -272,6 +274,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         conds = conds.transpose(1, 2)
 
         mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        # time_end = time.time()
+        # print(f"encoder time in ms: {(time_end - time_start) * 1000}")
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
@@ -282,4 +286,6 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         )
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
+        # time_decoder_end = time.time()
+        # print(f"decoder time in ms: {(time_decoder_end - time_end) * 1000}")
         return feat.float(), None
