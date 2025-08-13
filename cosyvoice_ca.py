@@ -63,6 +63,9 @@ class CosyVoiceCA:
         # 使用deque替代list，提高性能
         self.speech_tokens = deque()
         self.offset = 151936
+        self.end_of_prompt = 151646
+        self.start_of_seq = 158500
+        self.turn_of_speech = 158497
 
         self.token_hop_len = 25
         self.token_overlap_len = 20
@@ -145,8 +148,10 @@ class CosyVoiceCA:
                 
             hift_path = os.path.join(self.model_dir, "hift.pt")
             # spk2info = os.path.join(self.model_dir, "spk2info-old-newcreate.pt")
-            spk2info = os.path.join(self.model_dir, "spk2info-normal.pt")
-            # spk2info = os.path.join(self.model_dir, "spk2info-tong.pt")
+            # spk2info = os.path.join(self.model_dir, "spk2info-normal.pt")
+            # spk2info = os.path.join(self.model_dir, "spk2info-surprise.pt")
+            spk2info = os.path.join(self.model_dir, "spk2info-surprise-800.pt")
+            # spk2info = os.path.join(self.model_dir, "spk2info-surprise-trimed.pt")
             # 检查文件是否存在
             if not os.path.exists(flow_path):
                 raise ValueError(f"Flow模型文件不存在: {flow_path}")
@@ -196,7 +201,7 @@ class CosyVoiceCA:
                 self.model_dir, 
                 # f"flow.decoder.estimator.fp16.mygpu.plan"
                 f"flow.decoder.estimator.fp16.new.plan"
-                # f"flow.decoder.estimator.fp16.A10.plan"
+                # f"flow.decoder.estimator.fp16.4090.plan"
                 # f"flow.decoder.estimator.fp16.3070.plan"
             )
             
@@ -268,19 +273,23 @@ class CosyVoiceCA:
             logging.error(f"处理响应时出错: {str(e)}")
             yield {"error": f"处理响应错误: {str(e)}"}
     
-    def _prepare_input_features(self, text: str):
+    def _prepare_input_features(self, text: str, instruct: str = None):
         """准备输入特征"""
         text_token = self.tokenizer.encode(text, allowed_special=self.allowed_special)
-        # print(text_token, text)
+        print(text_token, text)
         text_len = len(text_token)
         model_input = self.spk2info
-        prompt_text = model_input['prompt_text'].squeeze().tolist()
-        llm_input = [158500] + prompt_text +text_token + [158497]
-        # text_token = torch.tensor([text_token], dtype=torch.int32).to(self.device)
-        # text_token_len = torch.tensor([text_token.shape[1]], dtype=torch.int32).to(self.device)
+        prompt_text = []
 
-        speech_prompt_token = model_input['llm_prompt_speech_token'] + self.offset
-        llm_input = llm_input + speech_prompt_token.squeeze().tolist()
+        if instruct is not None:
+            prompt_text = self.tokenizer.encode(instruct, allowed_special=self.allowed_special)
+            prompt_text.append(int(self.end_of_prompt))
+        else:
+            prompt_text = model_input['prompt_text'].squeeze().tolist()
+        llm_input = [self.start_of_seq] + prompt_text + text_token + [self.turn_of_speech]
+        if instruct is None:
+            speech_prompt_token = model_input['llm_prompt_speech_token'] + self.offset
+            llm_input = llm_input + speech_prompt_token.squeeze().tolist()
         model_input['llm_input'] = llm_input
         model_input['text_len'] = text_len
         return model_input
@@ -302,8 +311,9 @@ class CosyVoiceCA:
                 "top_k": 25, 
                 "temperature": 1.0, 
                 "max_new_tokens": text_len * self.sgl_config.get('max_token_text_ratio', 20), 
-                "ras_penalty": 3.0,
-                "stop_token_ids": [158497]
+                "min_new_tokens": text_len * self.sgl_config.get('min_token_text_ratio', 3),
+                "ras_penalty": 1.0,
+                "stop_token_ids": [self.turn_of_speech + i for i in range(3)]
             }
         }
         
@@ -311,7 +321,7 @@ class CosyVoiceCA:
             # 使用锁保护对speech_tokens的修改
             with self.lock:
                 self.speech_tokens.extend(i["tokens"])
-                if self.speech_tokens and self.speech_tokens[-1] == 6561 + self.offset:
+                if self.speech_tokens and self.speech_tokens[-1] >= 6561 + self.offset:
                     self.speech_tokens.pop()
             
             # if len(self.speech_tokens) >= self.token_hop_len + self.flow.pre_lookahead_len:
@@ -379,13 +389,13 @@ class CosyVoiceCA:
         
         return None
 
-    def synthesize(self, text: str, session_id: str = "default") -> Generator[Dict, None, None]:
+    def synthesize(self, text: str, instruct: str = None) -> Generator[Dict, None, None]:
         """
         合成语音 - 带容错机制
         
         Args:
             text: 输入文本
-            session_id: 会话ID
+            instruct: 输入指令
             
         Returns:
             生成器，产生包含生成的token的字典
@@ -407,7 +417,7 @@ class CosyVoiceCA:
                 self.speech_tokens.clear()
                 self.llm_end = False
             
-            model_input = self._prepare_input_features(text)
+            model_input = self._prepare_input_features(text, instruct)
             time_llm_start = time.time()
             p = threading.Thread(target=self._llm_job, args=(model_input['llm_input'], model_input['text_len']))
             p.start()
@@ -531,6 +541,7 @@ class CosyVoiceCA:
 
     def token2wav(self, token, prompt_token, prompt_token_len, prompt_feat, prompt_feat_len, embedding, token_offset, finalize=False, mask=None):
         with torch.cuda.amp.autocast(self.fp16):
+            print(token)
             tts_mel, _ = self.flow.inference(token=token.to(self.device),
                                              token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
                                              prompt_token=prompt_token.to(self.device),
@@ -657,6 +668,7 @@ if __name__ == "__main__":
             chunk_count = 0
             log_and_print("开始合成，实时输出音频块...")
             
+            # for result in cosyvoice_ca.synthesize(text, instruct="用四川话说"):
             for result in cosyvoice_ca.synthesize(text):
                 chunk_count += 1
                 # 记录首包时间
